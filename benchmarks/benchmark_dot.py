@@ -7,7 +7,7 @@ add_tritonblas_lib()
 import tritonblas as tb
 
 
-DEVICE = "cuda"
+DEVICE = triton.runtime.driver.active.get_current_target().backend
 
 
 @triton.testing.perf_report(
