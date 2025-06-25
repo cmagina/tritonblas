@@ -3,6 +3,35 @@
 import torch
 import triton
 import triton.language as tl
+from typing import NamedTuple
+
+
+def unpack_grid(grid):
+    if len(grid) == 1:
+        return grid[0], 1, 1
+    if len(grid) == 2:
+        return grid[0], grid[1], 1
+    if len(grid) == 3:
+        return grid[0], grid[1], grid[2]
+
+
+def metadata_fn(
+    grid: tuple,
+    metadata: NamedTuple,
+    args: dict,
+):
+    grid_x, grid_y, grid_z = unpack_grid(grid)
+    num_warps = metadata.num_warps
+    num_stages = metadata.num_stages
+    cluster_x, cluster_y, cluster_z = metadata.cluster_dims
+    shared_memory = metadata.shared
+    M, K = args["a_ptr"].shape
+    _, N = args["b_ptr"].shape
+    return {
+        "name": f"gemm_<grid:{grid_x}x{grid_y}x{grid_z}>_<cluster:{cluster_x}x{cluster_y}x{cluster_z}>_<warps:{num_warps}>_<shared:{shared_memory}>_<stages:{num_stages}>",
+        "flops": 2 * M * N * K,
+        "bytes": (M * N + N * K + K * M) * args["a_ptr"].element_size(),
+    }
 
 
 def __get_cuda_autotune_config():
@@ -232,18 +261,18 @@ def __get_hip_autotune_config():
 
 
 def __get_autotune_config():
-    if triton.runtime.driver.active.get_current_target().backend == "cuda":
-        return __get_cuda_autotune_config()
-    else:
+    if triton.runtime.driver.active.get_current_target().backend == "hip":
         return __get_hip_autotune_config()
+    else:
+        return __get_cuda_autotune_config()
 
 
 @triton.autotune(
     configs=__get_autotune_config(),
     key=["M", "N", "K"],
 )
-@triton.jit
-def __gemm_kernel(
+@triton.jit(launch_metadata=metadata_fn)
+def gemm_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -349,10 +378,11 @@ def __gemm_kernel(
     tl.store(output_block, accumulator, mask=c_mask)
 
 
-def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor = None, alpha=1, beta=0):
+def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor = None, alpha=1.0, beta=0.0):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible K dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
+    assert b.is_contiguous(), "Matrix B must be contiguous"
 
     # Get the matrix dimensions
     M, K = a.shape
@@ -364,7 +394,7 @@ def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor = None, alpha=1, beta
         assert c.shape[1] == N, "Incompatible N dimensions"
         assert c.is_contiguous(), "Matrix C must be contiguous"
     else:
-        c = torch.zeros((M, N), device=a.device, dtype=torch.float16)
+        c = torch.zeros((M, N), device=a.device, dtype=a.dtype)
 
     # Ensure the scalars are of type float to lower the conversion accumulation error
     alpha = float(alpha)
@@ -379,7 +409,7 @@ def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor = None, alpha=1, beta
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
-    __gemm_kernel[grid](
+    gemm_kernel[grid](
         a,
         b,
         c,
